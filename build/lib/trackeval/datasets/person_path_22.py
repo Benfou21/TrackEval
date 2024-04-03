@@ -8,8 +8,7 @@ from .. import utils
 from .. import _timing
 from ..utils import TrackEvalException
 
-
-class MotChallenge2DBox(_BaseDataset):
+class PersonPath22(_BaseDataset):
     """Dataset class for MOT Challenge 2D bounding box tracking"""
 
     @staticmethod
@@ -17,16 +16,16 @@ class MotChallenge2DBox(_BaseDataset):
         """Default class config values"""
         code_path = utils.get_code_path()
         default_config = {
-            'GT_FOLDER': os.path.join(code_path, 'data/gt/mot_challenge/'),  # Location of GT data
-            'TRACKERS_FOLDER': os.path.join(code_path, 'data/trackers/mot_challenge/'),  # Trackers location
+            'GT_FOLDER': os.path.join(code_path, 'data/gt/person_path_22/'),  # Location of GT data
+            'TRACKERS_FOLDER': os.path.join(code_path, 'data/trackers/person_path_22/'),  # Trackers location
             'OUTPUT_FOLDER': None,  # Where to save eval results (if None, same as TRACKERS_FOLDER)
             'TRACKERS_TO_EVAL': None,  # Filenames of trackers to eval (if None, all in folder)
             'CLASSES_TO_EVAL': ['pedestrian'],  # Valid: ['pedestrian']
-            'BENCHMARK': 'MOT17',  # Valid: 'MOT17', 'MOT16', 'MOT20', 'MOT15'
-            'SPLIT_TO_EVAL': 'train',  # Valid: 'train', 'test', 'all'
+            'BENCHMARK': 'person_path_22',  # Valid: 'person_path_22'
+            'SPLIT_TO_EVAL': 'test',  # Valid: 'train', 'test', 'all'
             'INPUT_AS_ZIP': False,  # Whether tracker input files are zipped
             'PRINT_CONFIG': True,  # Whether to print current config
-            'DO_PREPROC': True,  # Whether to perform preprocessing (never done for MOT15)
+            'DO_PREPROC': True,  # Whether to perform preprocessing
             'TRACKER_SUB_FOLDER': 'data',  # Tracker files are in TRACKER_FOLDER/tracker_name/TRACKER_SUB_FOLDER
             'OUTPUT_SUB_FOLDER': '',  # Output files are saved in OUTPUT_FOLDER/tracker_name/OUTPUT_SUB_FOLDER
             'TRACKER_DISPLAY_NAMES': None,  # Names of trackers to display, if None: TRACKERS_TO_EVAL
@@ -197,8 +196,14 @@ class MotChallenge2DBox(_BaseDataset):
             else:
                 file = os.path.join(self.tracker_fol, tracker, self.tracker_sub_fol, seq + '.txt')
 
+        # Ignore regions
+        if is_gt:
+            crowd_ignore_filter = {7: ['13']}
+        else:
+            crowd_ignore_filter = None
+
         # Load raw data from text file
-        read_data, ignore_data = self._load_simple_text_file(file, is_zipped=self.data_is_zipped, zip_file=zip_file)
+        read_data, ignore_data = self._load_simple_text_file(file, is_zipped=self.data_is_zipped, zip_file=zip_file, crowd_ignore_filter=crowd_ignore_filter)
 
         # Convert data to required format
         num_timesteps = self.seq_lengths[seq]
@@ -225,7 +230,7 @@ class MotChallenge2DBox(_BaseDataset):
             time_key = str(t+1)
             if time_key in read_data.keys():
                 try:
-                    time_data = np.asarray(read_data[time_key], dtype=float)
+                    time_data = np.asarray(read_data[time_key], dtype=np.float)
                 except ValueError:
                     if is_gt:
                         raise TrackEvalException(
@@ -270,7 +275,11 @@ class MotChallenge2DBox(_BaseDataset):
                 else:
                     raw_data['tracker_confidences'][t] = np.empty(0)
             if is_gt:
-                raw_data['gt_crowd_ignore_regions'][t] = np.empty((0, 4))
+                if time_key in ignore_data.keys():
+                    time_ignore = np.asarray(ignore_data[time_key], dtype=np.float)
+                    raw_data['gt_crowd_ignore_regions'][t] = np.atleast_2d(time_ignore[:, 2:6])
+                else:
+                    raw_data['gt_crowd_ignore_regions'][t] = np.empty((0, 4))
 
         if is_gt:
             key_map = {'ids': 'gt_ids',
@@ -347,6 +356,7 @@ class MotChallenge2DBox(_BaseDataset):
             tracker_classes = raw_data['tracker_classes'][t]
             tracker_confidences = raw_data['tracker_confidences'][t]
             similarity_scores = raw_data['similarity_scores'][t]
+            crowd_ignore_regions = raw_data['gt_crowd_ignore_regions'][t]
 
             # Evaluation is ONLY valid for pedestrian class
             if len(tracker_classes) > 0 and np.max(tracker_classes) > 1:
@@ -357,7 +367,7 @@ class MotChallenge2DBox(_BaseDataset):
             # Match tracker and gt dets (with hungarian algorithm) and remove tracker dets which match with gt dets
             # which are labeled as belonging to a distractor class.
             to_remove_tracker = np.array([], np.int)
-            if self.do_preproc and self.benchmark != 'MOT15' and gt_ids.shape[0] > 0 and tracker_ids.shape[0] > 0:
+            if self.do_preproc and self.benchmark != 'MOT15' and (gt_ids.shape[0] > 0 or len(crowd_ignore_regions) > 0) and tracker_ids.shape[0] > 0:
 
                 # Check all classes are valid:
                 invalid_classes = np.setdiff1d(np.unique(gt_classes), self.valid_class_numbers)
@@ -379,6 +389,11 @@ class MotChallenge2DBox(_BaseDataset):
 
                 is_distractor_class = np.isin(gt_classes[match_rows], distractor_classes)
                 to_remove_tracker = match_cols[is_distractor_class]
+
+                # remove bounding boxes that overlap with crowd ignore region.
+                intersection_with_ignore_region = self._calculate_box_ious(tracker_dets, crowd_ignore_regions, box_format='xywh', do_ioa=True)
+                is_within_crowd_ignore_region = np.any(intersection_with_ignore_region > 0.95 + np.finfo('float').eps, axis=1)
+                to_remove_tracker = np.unique(np.concatenate([to_remove_tracker, np.where(is_within_crowd_ignore_region)[0]]))
 
             # Apply preprocessing to remove all unwanted tracker dets.
             data['tracker_ids'][t] = np.delete(tracker_ids, to_remove_tracker, axis=0)
